@@ -1,0 +1,6 @@
+{
+  "name": "Prestiben",
+  "description": "Plateforme de mise en relation instantanée pour services à domicile au Bénin (Cotonou, Porto-Novo). Matching temps réel, suivi GPS et paiement sécurisé.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": []
+}
