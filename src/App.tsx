@@ -30,7 +30,17 @@ import { io, Socket } from "socket.io-client";
 import { cn } from "./lib/utils";
 import { auth, db, signInWithGoogle, setupRecaptcha, sendOtp } from "./lib/firebase";
 import { onAuthStateChanged, signOut, User as FirebaseUser, ConfirmationResult } from "firebase/auth";
-import { doc, getDoc, setDoc, serverTimestamp } from "firebase/firestore";
+import { 
+  doc, 
+  getDoc, 
+  setDoc, 
+  serverTimestamp, 
+  collection, 
+  query, 
+  where, 
+  onSnapshot,
+  orderBy
+} from "firebase/firestore";
 
 // Types
 type AppState = "splash" | "onboarding" | "auth" | "role_selection" | "kyc" | "main";
@@ -102,7 +112,6 @@ export default function App() {
   const [step, setStep] = useState<"selection" | "details" | "matching" | "active" | "provider_dashboard">("selection");
   const [selectedService, setSelectedService] = useState<Service | null>(null);
   const [serviceDetails, setServiceDetails] = useState("");
-  const [socket, setSocket] = useState<Socket | null>(null);
   const [activeRequest, setActiveRequest] = useState<Request | null>(null);
   const [availableRequests, setAvailableRequests] = useState<Request[]>([]);
   const [isSearching, setIsSearching] = useState(false);
@@ -166,27 +175,53 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  // Socket setup
+  // Client: Active Request Listener
   useEffect(() => {
-    const s = io();
-    setSocket(s);
-    
-    s.on("new_request", (req: Request) => setAvailableRequests(prev => [...prev, req]));
-    s.on("request_matched", (req: Request) => {
-      setActiveRequest(req);
-      setStep("active");
-      setIsSearching(false);
-    });
-    s.on("match_confirmed", (req: Request) => {
-      setActiveRequest(req);
-      setStep("active");
-    });
-    return () => { s.disconnect(); };
-  }, []);
+    if (role === "client" && user && (step === "matching" || step === "active")) {
+      const q = query(
+        collection(db, "requests"),
+        where("clientId", "==", user.uid)
+      );
+
+      const unsubscribe = onSnapshot(q, (snapshot) => {
+        // Find the most recent matched request in memory
+        const requests = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Request));
+        const matched = requests.find(r => r.status === "matched");
+        
+        if (matched) {
+          setActiveRequest(matched);
+          setStep("active");
+          setIsSearching(false);
+        }
+      }, (error) => console.error("Client listener error:", error));
+
+      return () => unsubscribe();
+    }
+  }, [role, user, step]);
+
+  // Provider: Real-time Missions Listener
+  useEffect(() => {
+    if (role === "provider" && appState === "main") {
+      const q = query(
+        collection(db, "requests"),
+        where("status", "==", "pending")
+      );
+
+      const unsubscribe = onSnapshot(q, (snapshot) => {
+        const requests = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data()
+        })) as Request[];
+        setAvailableRequests(requests);
+      }, (error) => console.error("Provider listener error:", error));
+
+      return () => unsubscribe();
+    }
+  }, [role, appState]);
 
   // Provider Location Tracker
   useEffect(() => {
-    if (role === "provider" && appState === "main") {
+    if (role === "provider" && appState === "main" && user) {
       const watchId = navigator.geolocation.watchPosition(
         (position) => {
           const loc = { 
@@ -195,14 +230,18 @@ export default function App() {
             address: "Position actuelle" 
           };
           setUserLocation(loc);
-          socket?.emit("update_location", loc);
+          // Optional: Update provider position in Firestore for clients to see on map
+          setDoc(doc(db, "users", user.uid), {
+            location: loc,
+            lastSeen: serverTimestamp()
+          }, { merge: true });
         },
         (error) => console.warn("Provider location tracking failed:", error),
         { enableHighAccuracy: true }
       );
       return () => navigator.geolocation.clearWatch(watchId);
     }
-  }, [role, appState, socket]);
+  }, [role, appState, user]);
 
   const completeOnboarding = () => {
     localStorage.setItem("prestiben_onboarding_seen", "true");
@@ -289,7 +328,6 @@ export default function App() {
         console.error("Error saving user:", error);
       }
     }
-    socket?.emit("join", selectedRole);
   };
 
   // CLIENT ACTIONS
@@ -344,8 +382,6 @@ export default function App() {
         ...newRequest,
         createdAt: serverTimestamp()
       });
-      // Emit to socket
-      socket?.emit("request_service", newRequest);
     } catch (error) {
       console.error("Error matching:", error);
       setStep("selection");
@@ -380,7 +416,8 @@ export default function App() {
         matchedAt: serverTimestamp()
       }, { merge: true });
       
-      socket?.emit("accept_request", { requestId: request.id });
+      setActiveRequest(request);
+      setStep("active");
     } catch (error) {
        console.error("Accept error:", error);
     }
