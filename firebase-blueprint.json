@@ -1,0 +1,45 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "Represents a client or provider in the system",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "phone": { "type": "string" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "role": { "type": "string", "enum": ["client", "provider", "admin"] },
+        "status": { "type": "string", "enum": ["active", "pending_kyc", "suspended"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "role", "createdAt"]
+    },
+    "ServiceRequest": {
+      "title": "Service Request",
+      "description": "A request for a service from a client",
+      "type": "object",
+      "properties": {
+        "requestId": { "type": "string" },
+        "clientId": { "type": "string" },
+        "providerId": { "type": "string" },
+        "serviceType": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "matched", "in_progress", "completed", "cancelled"] },
+        "location": { "type": "object" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["requestId", "clientId", "serviceType", "status", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "Collection of user profiles"
+    },
+    "/requests/{requestId}": {
+      "schema": "ServiceRequest",
+      "description": "Collection of service requests"
+    }
+  }
+}
