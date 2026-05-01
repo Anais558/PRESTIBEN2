@@ -33,7 +33,7 @@ import { onAuthStateChanged, signOut, User as FirebaseUser, ConfirmationResult }
 import { doc, getDoc, setDoc, serverTimestamp } from "firebase/firestore";
 
 // Types
-type AppState = "splash" | "onboarding" | "auth" | "role_selection" | "main";
+type AppState = "splash" | "onboarding" | "auth" | "role_selection" | "kyc" | "main";
 
 interface Service {
   id: string;
@@ -41,15 +41,18 @@ interface Service {
   icon: React.ElementType;
   category: string;
   basePrice: number;
+  description: string;
 }
 
 interface Request {
   id: string;
   clientId: string;
   service: string;
-  location: { lat: number; lng: number };
+  serviceDescription?: string;
+  location: { lat: number; lng: number; address?: string };
   status: "pending" | "matched" | "in_progress" | "completed";
   providerId?: string;
+  price: number;
 }
 
 const ONBOARDING_SLIDES = [
@@ -77,14 +80,15 @@ const ONBOARDING_SLIDES = [
 ];
 
 const SERVICES: Service[] = [
-  { id: "plumber", name: "Plomberie", icon: Wrench, category: "Dépannage", basePrice: 5000 },
-  { id: "electrician", name: "Électricité", icon: Lightbulb, category: "Dépannage", basePrice: 5000 },
-  { id: "nanny", name: "Nounou", icon: Baby, category: "Services", basePrice: 15000 },
-  { id: "cleaning", name: "Ménage", icon: CleaningBucket, category: "Services", basePrice: 7000 },
+  { id: "plumber", name: "Plomberie", icon: Wrench, category: "Dépannage", basePrice: 5000, description: "Réparation fuites, installation robinetterie, débouchage." },
+  { id: "electrician", name: "Électricité", icon: Lightbulb, category: "Dépannage", basePrice: 5000, description: "Court-circuit, installation prises, ventilateurs, climatisation." },
+  { id: "nanny", name: "Nounou", icon: Baby, category: "Services", basePrice: 15000, description: "Garde d'enfants à domicile (journée ou soirée)." },
+  { id: "cleaning", name: "Ménage", icon: CleaningBucket, category: "Services", basePrice: 7000, description: "Nettoyage complet, repassage, entretien régulier." },
 ];
 
 export default function App() {
   const [appState, setAppState] = useState<AppState>("splash");
+  const [isInitializing, setIsInitializing] = useState(true);
   const [onboardingIndex, setOnboardingIndex] = useState(0);
   const [phoneNumber, setPhoneNumber] = useState("");
   const [otpMode, setOtpMode] = useState(false);
@@ -95,26 +99,55 @@ export default function App() {
   
   const [user, setUser] = useState<FirebaseUser | null>(null);
   const [role, setRole] = useState<"client" | "provider" | null>(null);
-  const [step, setStep] = useState<"selection" | "matching" | "active" | "provider_dashboard">("selection");
+  const [step, setStep] = useState<"selection" | "details" | "matching" | "active" | "provider_dashboard">("selection");
   const [selectedService, setSelectedService] = useState<Service | null>(null);
+  const [serviceDetails, setServiceDetails] = useState("");
   const [socket, setSocket] = useState<Socket | null>(null);
   const [activeRequest, setActiveRequest] = useState<Request | null>(null);
   const [availableRequests, setAvailableRequests] = useState<Request[]>([]);
   const [isSearching, setIsSearching] = useState(false);
+  const [userLocation, setUserLocation] = useState<{ lat: number; lng: number; address?: string } | null>(null);
 
-  // Auth Listener
+  const calculateDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => {
+    const R = 6371; // km
+    const dLat = (lat2 - lat1) * (Math.PI / 180);
+    const dLon = (lon2 - lon1) * (Math.PI / 180);
+    const a =
+      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(lat1 * (Math.PI / 180)) *
+        Math.cos(lat2 * (Math.PI / 180)) *
+        Math.sin(dLon / 2) *
+        Math.sin(dLon / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+  };
+
+  // KYC State
+  const [kycStep, setKycStep] = useState(1);
+  const [providerSkill, setProviderSkill] = useState("");
+  const [providerCity, setProviderCity] = useState("Cotonou");
+
+  // Auth & Initialization Listener
   useEffect(() => {
+    const hasSeenOnboarding = localStorage.getItem("prestiben_onboarding_seen");
+    
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
       setUser(firebaseUser);
+      
       if (firebaseUser) {
         try {
           const userDoc = await getDoc(doc(db, "users", firebaseUser.uid));
           if (userDoc.exists()) {
             const userData = userDoc.data();
             setRole(userData.role);
-            setAppState("main");
-            if (userData.role === "client") setStep("selection");
-            else setStep("provider_dashboard");
+            
+            if (userData.status === "pending_kyc" && userData.role === "provider") {
+              setAppState("kyc");
+            } else {
+              setAppState("main");
+              if (userData.role === "client") setStep("selection");
+              else setStep("provider_dashboard");
+            }
           } else {
             setAppState("role_selection");
           }
@@ -123,24 +156,15 @@ export default function App() {
           setAppState("role_selection");
         }
       } else {
-        // If not splash/onboarding, go to auth
-        if (appState !== "splash" && appState !== "onboarding") {
-           setAppState("auth");
-        }
+        if (hasSeenOnboarding) setAppState("auth");
+        else setAppState("onboarding");
       }
+      
+      setTimeout(() => setIsInitializing(false), 2000);
     });
-    return () => unsubscribe();
-  }, [appState]);
 
-  // Splash logic
-  useEffect(() => {
-    if (appState === "splash") {
-      const timer = setTimeout(() => {
-        setAppState("onboarding");
-      }, 2500);
-      return () => clearTimeout(timer);
-    }
-  }, [appState]);
+    return () => unsubscribe();
+  }, []);
 
   // Socket setup
   useEffect(() => {
@@ -160,15 +184,37 @@ export default function App() {
     return () => { s.disconnect(); };
   }, []);
 
-  const handleNextOnboarding = () => {
-    if (onboardingIndex < ONBOARDING_SLIDES.length - 1) {
-      setOnboardingIndex(prev => prev + 1);
-    } else {
-      setAppState("auth");
+  // Provider Location Tracker
+  useEffect(() => {
+    if (role === "provider" && appState === "main") {
+      const watchId = navigator.geolocation.watchPosition(
+        (position) => {
+          const loc = { 
+            lat: position.coords.latitude, 
+            lng: position.coords.longitude, 
+            address: "Position actuelle" 
+          };
+          setUserLocation(loc);
+          socket?.emit("update_location", loc);
+        },
+        (error) => console.warn("Provider location tracking failed:", error),
+        { enableHighAccuracy: true }
+      );
+      return () => navigator.geolocation.clearWatch(watchId);
     }
+  }, [role, appState, socket]);
+
+  const completeOnboarding = () => {
+    localStorage.setItem("prestiben_onboarding_seen", "true");
+    setAppState("auth");
   };
 
-  const handleSkipOnboarding = () => setAppState("auth");
+  const handleNextOnboarding = () => {
+    if (onboardingIndex < ONBOARDING_SLIDES.length - 1) setOnboardingIndex(prev => prev + 1);
+    else completeOnboarding();
+  };
+
+  const handleSkipOnboarding = () => completeOnboarding();
 
   const handlePhoneSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -183,7 +229,6 @@ export default function App() {
       } catch (error: any) {
         console.error("OTP Error:", error);
         alert(`Erreur d'envoi SMS: ${error.message}`);
-        // Reset recaptcha if failed
         const container = document.getElementById("recaptcha-container");
         if (container) container.innerHTML = "";
       } finally {
@@ -197,10 +242,9 @@ export default function App() {
     if (otp.length === 6 && confirmationResult) {
       try {
         await confirmationResult.confirm(otp);
-        // Auth state listener handles the rest
       } catch (error: any) {
         console.error("OTP Verify Error:", error);
-        alert("Code incorrect ou expiré.");
+        alert("Code incorrect.");
       }
     }
   };
@@ -212,7 +256,7 @@ export default function App() {
       await signInWithGoogle();
     } catch (error: any) {
       console.error("Login failed", error);
-      alert(`Erreur d'authentification Google: ${error.message}\n\nNote: Si vous êtes sur Vercel, vérifiez que votre domaine est ajouté dans la console Firebase (Authentication -> Paramètres -> Domaines autorisés).`);
+      alert(`Erreur Google Auth: ${error.message}`);
     } finally {
       setIsVerifyingGoogle(false);
     }
@@ -228,47 +272,126 @@ export default function App() {
     setRole(selectedRole);
     if (user) {
       try {
+        const status = selectedRole === "provider" ? "pending_kyc" : "active";
         await setDoc(doc(db, "users", user.uid), {
           userId: user.uid,
           email: user.email,
           displayName: user.displayName,
           photoURL: user.photoURL,
           role: selectedRole,
-          status: "active",
+          status,
           createdAt: serverTimestamp()
         }, { merge: true });
+        
+        if (selectedRole === "provider") setAppState("kyc");
+        else setAppState("main");
       } catch (error) {
         console.error("Error saving user:", error);
       }
     }
-    
     socket?.emit("join", selectedRole);
-    setAppState("main");
-    if (selectedRole === "client") {
+  };
+
+  // CLIENT ACTIONS
+  const startRequestProcess = (service: Service) => {
+    setSelectedService(service);
+    setStep("details");
+  };
+
+  const confirmAndMatch = async () => {
+    if (!selectedService || !user) return;
+    
+    setIsSearching(true);
+    setStep("matching");
+
+    let location = { lat: 6.3654, lng: 2.4183, address: "Fidjrossè, Cotonou" };
+
+    // Attempt real geolocation
+    try {
+      const position = await new Promise<GeolocationPosition>((resolve, reject) => {
+        navigator.geolocation.getCurrentPosition(resolve, reject, {
+          enableHighAccuracy: true,
+          timeout: 5000,
+          maximumAge: 0
+        });
+      });
+      location = { 
+        lat: position.coords.latitude, 
+        lng: position.coords.longitude, 
+        address: "Position actuelle" 
+      };
+      setUserLocation(location);
+    } catch (error) {
+      console.warn("Geolocation failed, using fallback:", error);
+      // Fallback is already set to 'location'
+    }
+    
+    const requestId = `REQ_${Math.random().toString(36).substring(7).toUpperCase()}`;
+    
+    const newRequest: Request = {
+      id: requestId,
+      clientId: user.uid,
+      service: selectedService.name,
+      serviceDescription: serviceDetails,
+      location,
+      status: "pending",
+      price: selectedService.basePrice
+    };
+
+    try {
+      // Save to Firestore
+      await setDoc(doc(db, "requests", requestId), {
+        ...newRequest,
+        createdAt: serverTimestamp()
+      });
+      // Emit to socket
+      socket?.emit("request_service", newRequest);
+    } catch (error) {
+      console.error("Error matching:", error);
       setStep("selection");
-    } else {
-      setStep("provider_dashboard");
     }
   };
 
-  const startRequest = (service: Service) => {
-    setSelectedService(service);
-    setIsSearching(true);
-    setStep("matching");
-    const location = { lat: 6.3654, lng: 2.4183 }; 
-    socket?.emit("request_service", { service: service.name, location });
+  // PROVIDER ACTIONS
+  const submitKYC = async () => {
+    if (!user) return;
+    try {
+      await setDoc(doc(db, "users", user.uid), {
+        status: "active", // Simplified for demo, should be pending_admin
+        providerSkill,
+        providerCity,
+        kycSubmittedAt: serverTimestamp()
+      }, { merge: true });
+      
+      setAppState("main");
+      setStep("provider_dashboard");
+    } catch (error) {
+      console.error("KYC Error:", error);
+    }
   };
 
-  const acceptRequest = (requestId: string) => {
-    socket?.emit("accept_request", { requestId });
+  const acceptRequest = async (request: Request) => {
+    if (!user) return;
+    try {
+      // Update Firestore
+      await setDoc(doc(db, "requests", request.id), {
+        status: "matched",
+        providerId: user.uid,
+        matchedAt: serverTimestamp()
+      }, { merge: true });
+      
+      socket?.emit("accept_request", { requestId: request.id });
+    } catch (error) {
+       console.error("Accept error:", error);
+    }
   };
 
   return (
     <div className="min-h-screen bg-white font-sans selection:bg-brand-green/20">
       <AnimatePresence mode="wait">
         
-        {/* 1. SPLASH SCREEN */}
-        {appState === "splash" && (
+        {/* 1. SPLASH SCREEN (Now controlled by isInitializing) */}
+        {isInitializing && (
           <motion.div 
             key="splash"
             initial={{ opacity: 1 }}
@@ -296,7 +419,7 @@ export default function App() {
         )}
 
         {/* 2. ONBOARDING CAROUSEL */}
-        {appState === "onboarding" && (
+        {!isInitializing && appState === "onboarding" && (
           <motion.div 
             key="onboarding"
             initial={{ opacity: 0 }}
@@ -368,7 +491,7 @@ export default function App() {
         )}
 
         {/* 3. AUTH SCREEN */}
-        {appState === "auth" && (
+        {!isInitializing && appState === "auth" && (
           <motion.div 
             key="auth"
             initial={{ opacity: 0, y: 20 }}
@@ -496,7 +619,7 @@ export default function App() {
         )}
 
         {/* 4. ROLE SELECTION */}
-        {appState === "role_selection" && (
+        {!isInitializing && appState === "role_selection" && (
           <motion.div 
             key="role_selection"
             initial={{ opacity: 0, scale: 0.95 }}
@@ -552,8 +675,85 @@ export default function App() {
           </motion.div>
         )}
 
+        {/* 4.5 KYC SCREEN */}
+        {!isInitializing && appState === "kyc" && (
+          <motion.div 
+            key="kyc"
+            initial={{ opacity: 0, x: 50 }}
+            animate={{ opacity: 1, x: 0 }}
+            className="min-h-screen p-8 flex flex-col"
+          >
+             <div className="flex-1 space-y-10 mt-8">
+               <div className="space-y-4">
+                  <span className="text-brand-green font-bold text-sm tracking-widest uppercase">Étape {kycStep}/2</span>
+                  <h2 className="text-3xl font-display font-bold">Vérification de Profil</h2>
+                  <p className="text-slate-500">Pour garantir la sécurité de la communauté Prestiben, tous les prestataires doivent être certifiés.</p>
+               </div>
+
+               {kycStep === 1 && (
+                 <div className="space-y-6">
+                    <div className="space-y-2">
+                       <label className="text-sm font-bold text-slate-400 ml-1">Votre domaine d'expertise</label>
+                       <select 
+                        value={providerSkill}
+                        onChange={(e) => setProviderSkill(e.target.value)}
+                        className="w-full h-16 bg-slate-50 border border-slate-200 rounded-2xl px-6 font-bold focus:outline-none focus:ring-2 focus:ring-brand-green"
+                       >
+                         <option value="">Choisir un métier...</option>
+                         {SERVICES.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                       </select>
+                    </div>
+
+                    <div className="space-y-2">
+                       <label className="text-sm font-bold text-slate-400 ml-1">Ville de résidence</label>
+                       <select 
+                        value={providerCity}
+                        onChange={(e) => setProviderCity(e.target.value)}
+                        className="w-full h-16 bg-slate-50 border border-slate-200 rounded-2xl px-6 font-bold"
+                       >
+                         <option value="Cotonou">Cotonou</option>
+                         <option value="Abomey-Calavi">Abomey-Calavi</option>
+                         <option value="Porto-Novo">Porto-Novo</option>
+                       </select>
+                    </div>
+
+                    <button 
+                      onClick={() => providerSkill && setKycStep(2)}
+                      disabled={!providerSkill}
+                      className="w-full bg-slate-900 text-white font-bold h-16 rounded-2xl disabled:opacity-50 transition-all"
+                    >
+                      Suivant
+                    </button>
+                 </div>
+               )}
+
+               {kycStep === 2 && (
+                 <div className="space-y-8">
+                    <div className="p-8 border-2 border-dashed border-slate-200 rounded-3xl text-center space-y-4 hover:border-brand-green transition-colors cursor-pointer bg-slate-50/50">
+                       <div className="w-16 h-16 bg-white rounded-2xl flex items-center justify-center mx-auto shadow-sm">
+                          <Smartphone className="w-8 h-8 text-slate-400" />
+                       </div>
+                       <div>
+                         <p className="font-bold">Photo de votre Carte d'Identité / CIP</p>
+                         <p className="text-xs text-slate-400">Assurez-vous que les informations sont lisibles.</p>
+                       </div>
+                    </div>
+
+                    <button 
+                      onClick={submitKYC}
+                      className="w-full bg-brand-green text-white font-bold h-16 rounded-2xl shadow-xl shadow-brand-green/30"
+                    >
+                      Finaliser l'inscription
+                    </button>
+                    <button onClick={() => setKycStep(1)} className="w-full text-slate-400 font-bold">Retour</button>
+                 </div>
+               )}
+             </div>
+          </motion.div>
+        )}
+
         {/* 5. MAIN APPLICATION */}
-        {appState === "main" && (
+        {!isInitializing && appState === "main" && (
           <motion.div 
             key="main"
             initial={{ opacity: 0 }}
@@ -609,7 +809,7 @@ export default function App() {
                         {SERVICES.map(s => (
                           <button 
                             key={s.id} 
-                            onClick={() => startRequest(s)}
+                            onClick={() => startRequestProcess(s)}
                             className="bg-white p-6 rounded-[32px] border border-slate-100 shadow-sm hover:shadow-xl transition-all text-left space-y-4 group active:scale-95"
                           >
                              <div className="w-14 h-14 bg-slate-50 rounded-2xl flex items-center justify-center text-brand-green group-hover:bg-brand-green group-hover:text-white transition-colors">
@@ -622,6 +822,56 @@ export default function App() {
                           </button>
                         ))}
                        </div>
+                    </motion.div>
+                  )}
+
+                  {step === "details" && selectedService && (
+                    <motion.div key="details" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="space-y-8">
+                       <button onClick={() => setStep("selection")} className="flex items-center gap-2 text-slate-400 font-bold">
+                          <ArrowRight className="w-4 h-4 rotate-180" /> Retour
+                       </button>
+
+                       <div className="bg-slate-50 border border-slate-200 rounded-[32px] p-8 space-y-6">
+                          <div className="flex items-center gap-4">
+                             <div className="w-16 h-16 bg-white rounded-2xl flex items-center justify-center text-brand-green shadow-sm">
+                                <selectedService.icon className="w-8 h-8" />
+                             </div>
+                             <div>
+                               <h2 className="text-2xl font-bold">{selectedService.name}</h2>
+                               <p className="text-sm text-slate-400">{selectedService.category}</p>
+                             </div>
+                          </div>
+                          
+                          <p className="text-slate-600 text-sm italic">"{selectedService.description}"</p>
+                       </div>
+
+                       <div className="space-y-4">
+                          <label className="font-bold text-slate-900 ml-1">Décrivez votre besoin</label>
+                          <textarea 
+                            value={serviceDetails}
+                            onChange={(e) => setServiceDetails(e.target.value)}
+                            placeholder="Ex: Mon robinet de cuisine fuit depuis ce matin..."
+                            className="w-full bg-slate-50 border border-slate-200 rounded-3xl p-6 h-32 focus:ring-2 focus:ring-brand-green focus:outline-none font-medium"
+                          />
+                       </div>
+
+                       <div className="bg-white border-2 border-brand-green/20 rounded-3xl p-6 flex justify-between items-center shadow-lg shadow-brand-green/5">
+                          <div>
+                             <p className="text-[10px] uppercase font-bold text-slate-400 tracking-widest">Estimation</p>
+                             <p className="text-2xl font-bold text-slate-900">{selectedService.basePrice} <small className="text-xs">FCFA</small></p>
+                          </div>
+                          <div className="flex items-center gap-2 text-brand-green font-bold text-sm bg-brand-green/10 px-3 py-1 rounded-full">
+                            <Clock className="w-4 h-4" /> 60s max
+                          </div>
+                       </div>
+
+                       <button 
+                        onClick={confirmAndMatch}
+                        className="w-full bg-slate-900 text-white font-bold h-16 rounded-2xl flex items-center justify-center gap-3 shadow-xl"
+                       >
+                         Lancer la recherche
+                         <ArrowRight className="w-5 h-5" />
+                       </button>
                     </motion.div>
                   )}
 
@@ -745,15 +995,26 @@ export default function App() {
                                       <div>
                                         <h4 className="font-bold text-xl">{req.service}</h4>
                                         <div className="flex items-center gap-1 text-slate-400 text-xs mt-1">
-                                          <MapPin className="w-3 h-3" /> Cotonou • 2.4 km
+                                          <MapPin className="w-3 h-3" /> 
+                                          {req.location.address || "Cotonou"} • 
+                                          {userLocation ? (
+                                            ` ${calculateDistance(userLocation.lat, userLocation.lng, req.location.lat, req.location.lng).toFixed(1)} km`
+                                          ) : (
+                                            " Calcul..."
+                                          )}
                                         </div>
                                       </div>
                                     </div>
                                     <div className="font-bold text-slate-900 bg-slate-50 px-4 py-2 rounded-2xl border border-slate-100">
-                                      5,000 <small className="text-[10px]">F</small>
+                                      {req.price} <small className="text-[10px]">F</small>
                                     </div>
                                  </div>
-                                 <button onClick={() => acceptRequest(req.id)} className="w-full bg-slate-900 text-white font-bold py-5 rounded-[20px] shadow-xl hover:bg-brand-green transition-colors active:scale-95">Accepter la mission</button>
+                                 {req.serviceDescription && (
+                                   <p className="text-sm text-slate-500 line-clamp-2 bg-slate-50 p-4 rounded-2xl border border-slate-100 italic">
+                                     "{req.serviceDescription}"
+                                   </p>
+                                 )}
+                                 <button onClick={() => acceptRequest(req)} className="w-full bg-slate-900 text-white font-bold py-5 rounded-[20px] shadow-xl hover:bg-brand-green transition-colors active:scale-95">Accepter la mission</button>
                               </motion.div>
                             ))
                           )}
